@@ -576,6 +576,106 @@ class TestRunJobSessionPersistence:
         assert kwargs["enabled_toolsets"] == ["memory", "file"]
         assert "memory" in kwargs["disabled_toolsets"]
 
+    def test_run_job_delivers_truncated_response_with_content(self, tmp_path):
+        """A truncated turn that accumulated real partial text must be delivered.
+
+        When the model hits its output-length limit, conversation_loop returns
+        completed=False with partial=True, carrying the accumulated
+        partial text in final_response and a distinct sentinel in
+        error.  Before the fix, the blanket completed=False check
+        (#17855) raised a RuntimeError, routing the job through the failure
+        path so the real content was replaced by a generic error summary and
+        nothing was delivered to Discord.
+
+        The partial text is real deliverable content — the delivery pipeline
+        already chunks long messages into multiple (1/N) posts.  Deliver it
+        instead of discarding it.
+        """
+        job = {
+            "id": "truncated-job",
+            "name": "truncated",
+            "prompt": "write a very long report",
+        }
+        fake_db = MagicMock()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "***",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {
+                "final_response": "A long partial report that hit the output limit...",
+                "completed": False,
+                "failed": False,
+                "partial": True,
+                "error": "Response remained truncated after 4 continuation attempts",
+            }
+            mock_agent_cls.return_value = mock_agent
+
+            success, output, final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert final_response == "A long partial report that hit the output limit..."
+        assert "A long partial report" in output
+        assert "(FAILED)" not in output
+
+    def test_run_job_fails_when_truncated_with_no_content(self, tmp_path):
+        """A truncated turn with NO real content must still fail.
+
+        When final_response equals error (or is empty), the model
+        produced nothing deliverable — this is a genuine failure, not a
+        deliverable incomplete turn.
+        """
+        job = {
+            "id": "truncated-empty-job",
+            "name": "truncated empty",
+            "prompt": "do something",
+        }
+        fake_db = MagicMock()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "***",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {
+                "final_response": "Response truncated due to output length limit",
+                "completed": False,
+                "failed": False,
+                "partial": True,
+                "error": "Response truncated due to output length limit",
+            }
+            mock_agent_cls.return_value = mock_agent
+
+            success, output, final_response, error = run_job(job)
+
+        assert success is False
+        assert final_response == ""
+        assert "(FAILED)" in output
+
     def test_tick_skips_due_jobs_while_dispatch_is_paused(self, tmp_path):
         """The drain gate runs before advancing a due job's schedule."""
         from cron.scheduler import tick

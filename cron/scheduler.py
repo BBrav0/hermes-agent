@@ -4314,24 +4314,43 @@ def run_job(
         # builds the proper failure tuple. (issue #17855)
         turn_exit_reason = str(result.get("turn_exit_reason") or "")
         final_response_text = (result.get("final_response") or "").strip()
-        max_iteration_summary = (
+        error_text = (result.get("error") or "").strip()
+        # Some incomplete turns (completed=False) still carry real, deliverable
+        # content. Instead of routing them through the failure path (which would
+        # discard the response and deliver a generic error summary), deliver the
+        # actual text — the delivery pipeline chunks long messages into multiple
+        # platform posts (1/N, 2/N, ...) automatically. Two cases:
+        #
+        #   1. max_iterations_reached — a fallback summary was produced.
+        #   2. partial truncation — the model hit its output-length limit after
+        #      accumulating real text across continuation attempts. The error
+        #      sentinel differs from final_response, proving the model produced
+        #      usable content (when they are identical the model produced nothing
+        #      at all and there is nothing to deliver).
+        deliverable_incomplete = (
             result.get("failed") is not True
             and result.get("completed") is False
-            and turn_exit_reason.startswith("max_iterations_reached(")
             and bool(final_response_text)
+            and (
+                turn_exit_reason.startswith("max_iterations_reached(")
+                or (
+                    result.get("partial") is True
+                    and final_response_text != error_text
+                )
+            )
         )
-        if result.get("failed") is True or (result.get("completed") is False and not max_iteration_summary):
+        if result.get("failed") is True or (result.get("completed") is False and not deliverable_incomplete):
             _err_text = (
                 result.get("error")
                 or final_response_text
                 or "agent reported failure"
             )
             raise RuntimeError(_err_text)
-        if max_iteration_summary:
+        if deliverable_incomplete:
             logger.warning(
-                "Job '%s' reached the iteration limit but produced a final fallback response; "
-                "delivering the response instead of failing the cron run",
-                job_name,
+                "Job '%s': turn ended incomplete (%s) but produced a "
+                "deliverable response — delivering instead of failing the cron run",
+                job_name, turn_exit_reason or "partial",
             )
 
         final_response = result.get("final_response", "") or ""
